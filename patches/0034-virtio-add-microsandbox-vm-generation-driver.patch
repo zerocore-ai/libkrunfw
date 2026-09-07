@@ -11,6 +11,10 @@ device config space. Clock reads latch fresh host time during processing.
 This gives VM clone and rollback users an event-driven completion boundary
 without polling or a userspace control round trip.
 
+Advertise a separate clock-only capability for ordinary resident resume.
+These requests retain the current identifier and do not notify clone-sensitive
+kernel consumers. Sample request flags within the same sequence read as the ID.
+
 Signed-off-by: Microsandbox <development@superrad.company>
 ---
 --- a/drivers/virtio/Kconfig
@@ -45,7 +49,7 @@ Signed-off-by: Microsandbox <development@superrad.company>
  virtio_rtc-$(CONFIG_VIRTIO_RTC_ARM) += virtio_rtc_arm.o
 --- /dev/null
 +++ b/drivers/virtio/virtio_msb_vmgenid.c
-@@ -0,0 +1,305 @@
+@@ -0,0 +1,322 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Microsandbox VM generation driver.
@@ -70,7 +74,9 @@ Signed-off-by: Microsandbox <development@superrad.company>
 +#define MSB_VMGENID_STATUS_READY	BIT(0)
 +#define MSB_VMGENID_STATUS_ERROR	BIT(1)
 +#define MSB_VMGENID_STATUS_CLOCK	BIT(2)
++#define MSB_VMGENID_STATUS_CLOCK_ONLY	BIT(3)
 +#define MSB_VMGENID_SYNC_CLOCK	BIT(0)
++#define MSB_VMGENID_CLOCK_ONLY	BIT(1)
 +
 +struct virtio_msb_vmgenid_config {
 +	__le32 version;
@@ -120,7 +126,7 @@ Signed-off-by: Microsandbox <development@superrad.company>
 +}
 +
 +static void msb_vmgenid_read_request(struct virtio_device *vdev,
-+				     u64 *sequence, u8 id[16])
++				     u64 *sequence, u8 id[16], u32 *flags)
 +{
 +	u64 before, after;
 +	u32 words[4];
@@ -141,6 +147,8 @@ Signed-off-by: Microsandbox <development@superrad.company>
 +			words[i] = msb_vmgenid_read_word(vdev,
 +				offsetof(struct virtio_msb_vmgenid_config,
 +					 generation_id) + i * sizeof(__le32));
++		*flags = msb_vmgenid_read_word(vdev,
++			offsetof(struct virtio_msb_vmgenid_config, request_flags));
 +		after = msb_vmgenid_join_sequence(
 +			msb_vmgenid_read_word(vdev,
 +				offsetof(struct virtio_msb_vmgenid_config,
@@ -227,7 +235,7 @@ Signed-off-by: Microsandbox <development@superrad.company>
 +		container_of(work, struct msb_vmgenid_dev, process_work);
 +	u8 id[16];
 +	u64 sequence;
-+	u32 version;
++	u32 version, flags;
 +
 +	version = msb_vmgenid_read_word(gdev->vdev,
 +		offsetof(struct virtio_msb_vmgenid_config, version));
@@ -239,7 +247,7 @@ Signed-off-by: Microsandbox <development@superrad.company>
 +	}
 +
 +	for (;;) {
-+		msb_vmgenid_read_request(gdev->vdev, &sequence, id);
++		msb_vmgenid_read_request(gdev->vdev, &sequence, id, &flags);
 +		if (!sequence)
 +			return;
 +
@@ -258,10 +266,22 @@ Signed-off-by: Microsandbox <development@superrad.company>
 +			return;
 +		}
 +
-+		add_vmfork_randomness(id, sizeof(id));
-+		if (msb_vmgenid_read_word(gdev->vdev,
-+		    offsetof(struct virtio_msb_vmgenid_config, request_flags)) &
-+		    MSB_VMGENID_SYNC_CLOCK) {
++		/* Ordinary resume corrects time without notifying clone-sensitive kernel
++		 * consumers or changing the VM identity. The host must retain last_id.
++		 */
++		if ((flags & ~(MSB_VMGENID_SYNC_CLOCK | MSB_VMGENID_CLOCK_ONLY)) ||
++		    ((flags & MSB_VMGENID_CLOCK_ONLY) &&
++		     (!(flags & MSB_VMGENID_SYNC_CLOCK) ||
++		      memcmp(id, gdev->last_id, sizeof(gdev->last_id))))) {
++			msb_vmgenid_write_word(gdev->vdev,
++				offsetof(struct virtio_msb_vmgenid_config, driver_status),
++				MSB_VMGENID_STATUS_READY | MSB_VMGENID_STATUS_CLOCK |
++				MSB_VMGENID_STATUS_CLOCK_ONLY | MSB_VMGENID_STATUS_ERROR);
++			return;
++		}
++		if (!(flags & MSB_VMGENID_CLOCK_ONLY))
++			add_vmfork_randomness(id, sizeof(id));
++		if (flags & MSB_VMGENID_SYNC_CLOCK) {
 +			int ret = msb_vmgenid_sync_clock(gdev->vdev);
 +
 +			if (ret) {
@@ -269,7 +289,7 @@ Signed-off-by: Microsandbox <development@superrad.company>
 +				msb_vmgenid_write_word(gdev->vdev,
 +					offsetof(struct virtio_msb_vmgenid_config, driver_status),
 +					MSB_VMGENID_STATUS_READY | MSB_VMGENID_STATUS_CLOCK |
-+					MSB_VMGENID_STATUS_ERROR);
++					MSB_VMGENID_STATUS_CLOCK_ONLY | MSB_VMGENID_STATUS_ERROR);
 +				return;
 +			}
 +		}
@@ -280,7 +300,7 @@ Signed-off-by: Microsandbox <development@superrad.company>
 +		/* A config change racing this work item can be coalesced by the
 +		 * workqueue. Re-read until the request we acknowledged remains current.
 +		 */
-+		msb_vmgenid_read_request(gdev->vdev, &sequence, id);
++		msb_vmgenid_read_request(gdev->vdev, &sequence, id, &flags);
 +		if (sequence == gdev->last_sequence &&
 +		    !memcmp(id, gdev->last_id, sizeof(gdev->last_id)))
 +			return;
@@ -318,7 +338,8 @@ Signed-off-by: Microsandbox <development@superrad.company>
 +	virtio_device_ready(vdev);
 +	msb_vmgenid_write_word(vdev,
 +		offsetof(struct virtio_msb_vmgenid_config, driver_status),
-+		MSB_VMGENID_STATUS_READY | MSB_VMGENID_STATUS_CLOCK);
++		MSB_VMGENID_STATUS_READY | MSB_VMGENID_STATUS_CLOCK |
++		MSB_VMGENID_STATUS_CLOCK_ONLY);
 +	schedule_work(&gdev->process_work);
 +	return 0;
 +}
