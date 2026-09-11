@@ -117,6 +117,12 @@ This will:
 3. Generate the C bundle.
 4. Cross-compile `libkrunfw.dll` using `x86_64-w64-mingw32-gcc`.
 
+## Guest poweroff
+
+The x86 kernel accepts `krun.poweroff=i8042` from a matching libkrun host. This enables the existing i8042 exit transport only at the final kernel poweroff step, after normal shutdown, and leaves higher-priority firmware handlers first. Without that exact opt-in, behavior is unchanged; ARM uses its existing platform poweroff path.
+
+Update the host and firmware together and boot a fresh guest to use this handler. Replacing the firmware file cannot update a kernel already running or retained in saved guest memory. Explicit custom command lines and SEV/TDX's built-in command-line overrides do not automatically inherit the host default.
+
 ## Known limitations
 
 * To save memory, the embedded kernel is configured with a limited number of CPUS. The CPU limit depends on the config target. If this kernel runs in a VM with more CPUs than it is configured for, only the first N CPUs will be initialized and used.
