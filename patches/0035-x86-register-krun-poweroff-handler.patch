@@ -28,7 +28,8 @@ diff --git a/arch/x86/kernel/reboot.c b/arch/x86/kernel/reboot.c
   */
  void (*pm_power_off)(void);
  EXPORT_SYMBOL(pm_power_off);
- 
+-
++
 +/*
 + * libkrun's x86 i8042 reset command is a terminal VMM exit, not a PC reset.
 + * Require the host's explicit declaration: a generic KVM/CPUID identity is
