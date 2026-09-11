@@ -1,0 +1,78 @@
+Subject: [PATCH] x86: complete explicit krun poweroff through i8042
+
+Without an installed poweroff handler Linux converts POWER_OFF to HALT.
+A halted KVM vCPU does not necessarily exit the VMM. Register a final
+poweroff callback only when libkrun declares krun.poweroff=i8042.
+
+The existing i8042 reset byte is a terminal exit in libkrun. Run it after
+orderly kernel shutdown and behind ordinary firmware poweroff handlers.
+Do not infer this contract from the generic hypervisor CPUID bit. ARM
+PSCI, guest HALT and reboot behavior remain unchanged.
+
+The host and firmware must both support this opt-in. Previously captured
+guest kernels do not acquire the handler by changing the host firmware.
+
+diff --git a/arch/x86/kernel/reboot.c b/arch/x86/kernel/reboot.c
+--- a/arch/x86/kernel/reboot.c
++++ b/arch/x86/kernel/reboot.c
+@@ -13,6 +13,8 @@
+ #include <linux/objtool.h>
+ #include <linux/pgtable.h>
+ #include <linux/kexec.h>
++#include <linux/err.h>
++#include <linux/string.h>
+ #include <acpi/reboot.h>
+ #include <asm/io.h>
+ #include <asm/apic.h>
+@@ -38,6 +38,51 @@
+  */
+ void (*pm_power_off)(void);
+ EXPORT_SYMBOL(pm_power_off);
+ 
++/*
++ * libkrun's x86 i8042 reset command is a terminal VMM exit, not a PC reset.
++ * Require the host's explicit declaration: a generic KVM/CPUID identity is
++ * not enough to safely use that transport on a different virtual machine.
++ */
++static bool krun_i8042_poweroff_enabled __initdata;
++
++static int __init krun_poweroff_setup(char *arg)
++{
++	krun_i8042_poweroff_enabled = arg && !strcmp(arg, "i8042");
++	return krun_i8042_poweroff_enabled ? 0 : -EINVAL;
++}
++early_param("krun.poweroff", krun_poweroff_setup);
++
++static int krun_i8042_poweroff(struct sys_off_data *data)
++{
++	/*
++	 * This is a final POWER_OFF callback, not a preparation notifier.
++	 * Device, syscore and machine shutdown have already completed.
++	 */
++	outb(0xfe, 0x64);
++	return NOTIFY_DONE;
++}
++
++static int __init krun_poweroff_init(void)
++{
++	struct sys_off_handler *handler;
++
++	if (!krun_i8042_poweroff_enabled)
++		return 0;
++
++	/* Leave normal firmware poweroff handlers ahead of this fallback. */
++	handler = register_sys_off_handler(SYS_OFF_MODE_POWER_OFF,
++					   SYS_OFF_PRIO_LOW,
++					   krun_i8042_poweroff, NULL);
++	if (IS_ERR(handler)) {
++		pr_err("krun poweroff registration failed: %ld\n", PTR_ERR(handler));
++		return PTR_ERR(handler);
++	}
++
++	pr_info("krun i8042 poweroff handler registered\n");
++	return 0;
++}
++late_initcall(krun_poweroff_init);
++
+ /*
+  * This is set if we need to go through the 'emergency' path.
